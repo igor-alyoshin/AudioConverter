@@ -9,6 +9,7 @@ import java.io.File
 import java.io.FileInputStream
 import java.lang.Error
 import java.nio.ByteBuffer
+import kotlin.math.max
 
 class WavToM4AConverter(private val sampleRate: Int, private val numberOfChannels: Int, private val bitRate: Int) {
     private val OUTPUT_AUDIO_FILE_MIME_TYPE = "audio/mp4a-latm"
@@ -17,10 +18,12 @@ class WavToM4AConverter(private val sampleRate: Int, private val numberOfChannel
 
     var wavFileHeaderSize = 44L
 
+    private var prevPTU = Long.MIN_VALUE
     private val tempBuffer = ByteArray(BUFFER_SIZE)
 
+    @Synchronized
     fun convert(inputWavFile: File, destinationM4aFile: File): ConversionResult {
-        Log.i("WavToM4AConverter", "Start conversion from WAV to M4A")
+        prevPTU = Long.MIN_VALUE
         val muxer = MediaMuxer(destinationM4aFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
         val wavFileInputStream = FileInputStream(inputWavFile)
         wavFileInputStream.skip(wavFileHeaderSize)
@@ -31,32 +34,42 @@ class WavToM4AConverter(private val sampleRate: Int, private val numberOfChannel
 
         try {
             while (outputBuffInfo.flags != MediaCodec.BUFFER_FLAG_END_OF_STREAM) {
-                queueInputBuffer(wavFileInputStream, codec, inputQueueProgress)
-                dequeueOutputBuffer(muxer, codec, outputBuffInfo)
+                val outputPtu = queueInputBuffer(wavFileInputStream, codec, inputQueueProgress)
+                dequeueOutputBuffer(muxer, codec, outputBuffInfo, outputPtu)
             }
-        } catch (error: Error) {
-            Log.e("WavToM4AConverter", "Error while converting WAV to M4A. Error message: ${error.message}")
-            return ConversionResult(error.message)
+        } catch (e: Throwable) {
+            Log.e("WavToM4AConverter", "Error while converting WAV to M4A. Error message: ${e.message}")
+            return ConversionResult(e.message)
         } finally {
             wavFileInputStream.close()
-            muxer.stop()
-            muxer.release()
+            try {
+                muxer.stop()
+            } catch (ignored: Exception) {
+            }
+            try {
+                muxer.release()
+            } catch (ignored: Exception) {
+            }
         }
-
-        Log.i("WavToM4AConverter", "Converting WAV to M4A finished")
-
         return ConversionResult()
     }
 
-    private fun queueInputBuffer(wavFileInputStream: FileInputStream, codec: MediaCodec, inputQueueProgress: InputQueueProgress) {
+    private fun queueInputBuffer(
+        wavFileInputStream: FileInputStream,
+        codec: MediaCodec,
+        inputQueueProgress: InputQueueProgress
+    ): Long {
         var hasMoreData = true
+        var result: Long = 0
 
         var inputBufferIndex = codec.dequeueInputBuffer(CODEC_TIMEOUT_IN_MS)
         while (inputBufferIndex != -1 && hasMoreData) {
             val destinationBuffer: ByteBuffer = codec.getInputBuffer(inputBufferIndex)!!
             destinationBuffer.clear()
 
-            val bytesRead: Int = wavFileInputStream.read(tempBuffer, 0, destinationBuffer.limit())
+            val limit = destinationBuffer.limit()
+            val bytesRead: Int = wavFileInputStream.read(tempBuffer, 0, limit)
+            result = max(result, 1000000L * (limit / 16) / sampleRate)
 
             if (bytesRead == -1) {
                 hasMoreData = false
@@ -70,9 +83,10 @@ class WavToM4AConverter(private val sampleRate: Int, private val numberOfChannel
 
             inputBufferIndex = codec.dequeueInputBuffer(CODEC_TIMEOUT_IN_MS)
         }
+        return result
     }
 
-    private fun dequeueOutputBuffer(muxer: MediaMuxer, codec: MediaCodec, outputBuffInfo: MediaCodec.BufferInfo) {
+    private fun dequeueOutputBuffer(muxer: MediaMuxer, codec: MediaCodec, outputBuffInfo: MediaCodec.BufferInfo, outputPtu: Long) {
         var audioTrackId = 0
 
         var outputBufferIndex = codec.dequeueOutputBuffer(outputBuffInfo, CODEC_TIMEOUT_IN_MS)
@@ -81,9 +95,14 @@ class WavToM4AConverter(private val sampleRate: Int, private val numberOfChannel
                 val encodedData = codec.getOutputBuffer(outputBufferIndex)!!
                 encodedData.position(outputBuffInfo.offset)
                 encodedData.limit(outputBuffInfo.offset + outputBuffInfo.size)
-
+                if (prevPTU < 0) {
+                    prevPTU = outputBuffInfo.presentationTimeUs
+                } else {
+                    outputBuffInfo.presentationTimeUs = prevPTU + outputPtu
+                    prevPTU = outputBuffInfo.presentationTimeUs
+                }
                 muxer.writeSampleData(audioTrackId, encodedData, outputBuffInfo)
-                codec.releaseOutputBuffer(outputBufferIndex, false);
+                codec.releaseOutputBuffer(outputBufferIndex, false)
             } else if (outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                 val outputFormat = codec.outputFormat
                 audioTrackId = muxer.addTrack(outputFormat)
